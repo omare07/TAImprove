@@ -1,0 +1,60 @@
+{
+  "processing": {
+    "use_he_specific": true,
+    "min_tissue_intensity": 10,
+    "max_background_intensity": 250,
+    "saturation_threshold": 0.95,
+    "close_kernel_size": 3,
+    "open_kernel_size": 2,
+    "min_object_area": 1000,
+    "area_ratio_threshold": 0.02,
+    "texture_window": 15,
+    "bubble_circularity_threshold": 0.7,
+    "glare_intensity_threshold": 230,
+    "edge_strength_threshold": 0.1,
+    "color_std_threshold": 5,
+    "he_green_threshold": 210,
+    "density_threshold": 0.05,
+    "max_hole_area": 5000,
+    "save_intermediate": false,
+    "verbose": true
+  },
+  "file_handling": {
+    "image_extensions": [".tif", ".tiff", ".png", ".jpg", ".jpeg"],
+    "mask_extensions": [".tif", ".tiff", ".png"],
+    "output_format": "tiff",
+    "save_intermediate": false
+  },
+  "visualization": {
+    "create_comparison_plots": true,
+    "create_artifact_plots": false,
+    "create_batch_summary": false,
+    "save_plots": true,
+    "plot_dpi": 300
+  },
+  "logging": {
+    "verbose": true,
+    "log_level": "INFO",
+    "log_file": null
+  },
+  "he_specific": {
+    "min_staining_intensity": 0.05,
+    "max_background_intensity": 0.85,
+    "hematoxylin_blue_min": 0.25,
+    "hematoxylin_saturation_min": 0.1,
+    "eosin_red_min": 0.2,
+    "eosin_pink_ratio": 1.1,
+    "bubble_brightness_threshold": 0.85,
+    "bubble_saturation_max": 0.15,
+    "bubble_min_circularity": 0.6,
+    "bubble_min_size": 150,
+    "close_kernel_size": 3,
+    "open_kernel_size": 2,
+    "min_tissue_area": 1000,
+    "max_tissue_brightness": 0.75,
+    "streak_brightness_threshold": 0.8,
+    "line_length_threshold": 100,
+    "line_aspect_ratio_min": 5,
+    "hough_threshold": 50
+  }
+} 
