@@ -431,11 +431,15 @@ class TissueMaskVisualizer:
         gray = rgb2gray(image)
         
         # Extract intensities for each region
-        background_intensities = gray[~original_mask & ~improved_mask]
-        original_tissue = gray[original_mask]
-        improved_tissue = gray[improved_mask]
-        added_regions = gray[improved_mask & ~original_mask]
-        removed_regions = gray[original_mask & ~improved_mask]
+        # Ensure masks are boolean for invert operations to prevent type errors
+        original_mask_bool = original_mask.astype(bool)
+        improved_mask_bool = improved_mask.astype(bool)
+        
+        background_intensities = gray[~original_mask_bool & ~improved_mask_bool]
+        original_tissue = gray[original_mask_bool]
+        improved_tissue = gray[improved_mask_bool]
+        added_regions = gray[improved_mask_bool & ~original_mask_bool]
+        removed_regions = gray[original_mask_bool & ~improved_mask_bool]
         
         # Create histogram
         bins = np.linspace(0, 1, 50)

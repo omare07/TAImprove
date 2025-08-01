@@ -85,6 +85,20 @@ def process_single_image(image_path: Path, mask_path: Path,
         output_mask_path = output_paths['improved_masks'] / f"{image_path.stem}_improved{mask_path.suffix}"
         ImageLoader.save_mask(improved_mask, output_mask_path)
         
+        # Save debugging outputs if enabled
+        if improver.config.get('save_intermediate', False):
+            try:
+                improver.save_debugging_outputs(
+                    metadata.get('intermediate_masks', {}),
+                    original_image,
+                    metadata.get('intermediate_masks', {}).get('artifact_mask', np.zeros_like(current_mask)),
+                    metadata.get('artifacts_detected', []),
+                    output_paths['improved_masks'].parent,  # Use parent to access base output dir
+                    image_path.stem
+                )
+            except Exception as debug_e:
+                improver.logger.warning(f"Failed to save debugging outputs: {debug_e}")
+        
         # Create visualizations if requested
         viz_success = True
         viz_error = None

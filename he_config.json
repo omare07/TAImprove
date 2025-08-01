@@ -47,7 +47,7 @@
     "bubble_brightness_threshold": 0.85,
     "bubble_saturation_max": 0.15,
     "bubble_min_circularity": 0.6,
-    "bubble_min_size": 150,
+    "bubble_min_size": 50,
     "close_kernel_size": 3,
     "open_kernel_size": 2,
     "min_tissue_area": 1000,

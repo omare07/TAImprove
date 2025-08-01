@@ -111,16 +111,23 @@ class HESpecificImprover:
         metadata['artifacts_detected'].append({'type': 'linear_streaks', 'count': int(linear_count)})
         metadata['steps'].append('linear_artifact_detection')
         
-        # Step 6: Combine information
-        # Start with staining mask, remove bubbles, bright regions, and linear artifacts
-        improved_mask = staining_mask & ~bubble_mask & ~bright_regions & ~linear_artifacts
-        metadata['steps'].append('mask_combination')
+        # Step 6: AGGRESSIVE artifact removal to ensure complete elimination
+        # Remove ALL detected artifacts completely while maintaining smooth boundaries
+        improved_mask = self._smooth_artifact_removal(
+            staining_mask, bubble_mask, bright_regions, linear_artifacts
+        )
+        metadata['steps'].append('aggressive_complete_artifact_removal')
         
-        # Step 7: Morphological refinement
+        # Step 7: POST-DETECTION large bubble removal
+        # Final check for any remaining large circular artifacts
+        improved_mask = self._final_large_bubble_removal(improved_mask, original_image)
+        metadata['steps'].append('final_large_bubble_removal')
+        
+        # Step 8: Morphological refinement
         improved_mask = self._morphological_cleanup(improved_mask)
         metadata['steps'].append('morphological_cleanup')
         
-        # Step 8: Size filtering
+        # Step 9: Size filtering
         improved_mask = self._size_filtering(improved_mask)
         metadata['steps'].append('size_filtering')
         
@@ -192,25 +199,49 @@ class HESpecificImprover:
         return analysis
     
     def _detect_he_air_bubbles(self, image: np.ndarray) -> np.ndarray:
-        """Detect air bubbles in H&E images using brightness and shape."""
+        """Detect air bubbles in H&E images using enhanced color-based analysis."""
         gray = rgb2gray(image)
         hsv_image = rgb2hsv(image)
         
-        # Air bubbles are very bright and have low saturation (nearly white)
+        # Enhanced air bubble detection with multiple criteria
+        
+        # Criterion 1: Very bright and low saturation (classic air bubbles)
         bright_mask = gray > self.config['bubble_brightness_threshold']
         low_saturation = hsv_image[:, :, 1] < self.config['bubble_saturation_max']
+        classic_bubbles = bright_mask & low_saturation
         
-        # Combine brightness and saturation criteria
-        potential_bubbles = bright_mask & low_saturation
+        # Criterion 2: EGREGIOUS air bubbles - extremely bright with uniform color
+        # These should be removed with high confidence
+        extremely_bright = gray > 0.95  # Even brighter threshold
+        extremely_low_sat = hsv_image[:, :, 1] < 0.05  # Almost no color
         
-        # Remove small noise
+        # Check for uniform tone (low color variation)
+        color_variation = np.std(image, axis=2)
+        uniform_tone = color_variation < 0.02
+        
+        egregious_bubbles = extremely_bright & extremely_low_sat & uniform_tone
+        
+        # Criterion 3: Medium brightness but very uniform and desaturated
+        medium_bright = (gray > 0.8) & (gray <= 0.95)
+        very_uniform = color_variation < 0.01
+        medium_bubbles = medium_bright & extremely_low_sat & very_uniform
+        
+        # Combine all bubble detection criteria
+        potential_bubbles = classic_bubbles | egregious_bubbles | medium_bubbles
+        
+        # Remove small noise but preserve bubble candidates
         potential_bubbles = morphology.binary_opening(potential_bubbles, morphology.disk(2))
         
-        # Analyze connected components for circularity
-        labeled_bubbles = measure.label(potential_bubbles)
-        bubble_mask = np.zeros_like(gray, dtype=bool)
+        # For egregious bubbles, skip shape analysis - remove them directly
+        egregious_bubbles_cleaned = morphology.binary_opening(egregious_bubbles, morphology.disk(1))
         
-        bubble_count = 0
+        # Analyze connected components for circularity (for non-egregious bubbles)
+        labeled_bubbles = measure.label(potential_bubbles & ~egregious_bubbles_cleaned)
+        bubble_mask = egregious_bubbles_cleaned.copy()  # Start with egregious bubbles
+        
+        bubble_count = np.sum(egregious_bubbles_cleaned > 0)
+        large_bubble_count = 0
+        
         for region in measure.regionprops(labeled_bubbles):
             if region.area >= self.config['bubble_min_size']:
                 # Calculate circularity (4π * area / perimeter²)
@@ -218,12 +249,37 @@ class HESpecificImprover:
                 area = region.area
                 circularity = 4 * np.pi * area / (perimeter ** 2) if perimeter > 0 else 0
                 
-                if circularity >= self.config['bubble_min_circularity']:
-                    # This is likely an air bubble
-                    bubble_mask[labeled_bubbles == region.label] = True
-                    bubble_count += 1
+                # ENHANCED DETECTION FOR LARGE BUBBLES
+                is_large_bubble = area > 1000  # Large bubble threshold
+                region_brightness = np.mean(gray[labeled_bubbles == region.label])
+                region_saturation = np.mean(hsv_image[:, :, 1][labeled_bubbles == region.label])
+                
+                # More aggressive criteria for large bubbles
+                if is_large_bubble:
+                    # For large bubbles, use much more lenient criteria
+                    min_circularity = 0.3  # Very lenient for large bubbles
+                    brightness_threshold = 0.75  # Lower brightness requirement
+                    saturation_threshold = 0.25  # Higher saturation tolerance
+                    
+                    # Large bubble criteria: size + (brightness OR low saturation OR decent circularity)
+                    is_bubble = (circularity >= min_circularity) or \
+                               (region_brightness >= brightness_threshold) or \
+                               (region_saturation <= saturation_threshold)
+                    
+                    if is_bubble:
+                        bubble_mask[labeled_bubbles == region.label] = True
+                        bubble_count += 1
+                        large_bubble_count += 1
+                        self.logger.debug(f"Large bubble detected: area={area}, circularity={circularity:.3f}, brightness={region_brightness:.3f}")
+                else:
+                    # Standard criteria for smaller bubbles
+                    min_circularity = 0.5 if region_brightness > 0.9 else self.config['bubble_min_circularity']
+                    
+                    if circularity >= min_circularity:
+                        bubble_mask[labeled_bubbles == region.label] = True
+                        bubble_count += 1
         
-        self.logger.info(f"Detected {bubble_count} air bubbles")
+        self.logger.info(f"Detected {bubble_count} air bubbles (including {large_bubble_count} large bubbles, {np.sum(egregious_bubbles_cleaned > 0)} egregious bubbles)")
         return bubble_mask
     
     def _create_he_staining_mask(self, image: np.ndarray) -> np.ndarray:
@@ -283,17 +339,47 @@ class HESpecificImprover:
         return staining_mask
     
     def _detect_bright_artifacts(self, image: np.ndarray) -> np.ndarray:
-        """Detect overly bright regions that are likely artifacts."""
+        """Detect overly bright regions and structured noise that are likely artifacts."""
         gray = rgb2gray(image)
+        color_std = np.std(image, axis=2)
         
-        # Very bright regions
+        # Method 1: Very bright regions (classic bright artifacts)
         bright_artifacts = gray > self.config['max_tissue_brightness']
         
-        # Also check for regions with very little color variation (uniform bright areas)
-        color_std = np.std(image, axis=2)
+        # Method 2: Uniform bright areas with little color variation
         uniform_bright = (gray > 0.8) & (color_std < 0.05)
         
-        return bright_artifacts | uniform_bright
+        # Method 3: STRUCTURED NOISE detection - grid-like patterns
+        # These often appear as repeating bright patterns
+        from scipy.ndimage import uniform_filter
+        
+        # Calculate local variance to detect structured patterns
+        local_mean = uniform_filter(gray, size=5)
+        local_variance = uniform_filter(gray**2, size=5) - local_mean**2
+        
+        # Low variance but bright regions often indicate structured noise
+        structured_noise = (gray > 0.7) & (local_variance < 0.01) & (color_std < 0.03)
+        
+        # Method 4: Edge-based structured artifact detection
+        # Look for regions with repetitive edge patterns
+        edges = feature.canny(gray, sigma=1.0)
+        edge_density = uniform_filter(edges.astype(float), size=7)
+        
+        # High edge density in bright regions often indicates artifacts
+        edge_artifacts = (gray > 0.75) & (edge_density > 0.3) & (color_std < 0.04)
+        
+        # Method 5: Detect regions that are bright but have unnatural uniformity
+        # (common in scanning artifacts and processing errors)
+        unnatural_uniform = (gray > 0.85) & (color_std < 0.02)
+        
+        # Combine all bright artifact detection methods
+        all_bright_artifacts = bright_artifacts | uniform_bright | structured_noise | edge_artifacts | unnatural_uniform
+        
+        # Clean up small isolated pixels
+        all_bright_artifacts = morphology.binary_opening(all_bright_artifacts, morphology.disk(2))
+        
+        self.logger.info(f"Detected bright artifacts: {np.sum(all_bright_artifacts)} pixels")
+        return all_bright_artifacts
     
     def _detect_linear_artifacts(self, image: np.ndarray) -> np.ndarray:
         """Detect linear artifacts like streaks, lines, and scanning artifacts."""
@@ -413,17 +499,88 @@ class HESpecificImprover:
         return artifacts
     
     def _morphological_cleanup(self, mask: np.ndarray) -> np.ndarray:
-        """Apply morphological operations to clean up the mask."""
-        # Remove small noise
-        cleaned = morphology.binary_opening(mask, morphology.disk(self.config['open_kernel_size']))
+        """Apply morphological operations to clean up the mask without creating checkerboard patterns."""
+        # Use smaller kernels to prevent aggressive morphological operations that can create patterns
+        conservative_open_size = min(self.config['open_kernel_size'], 2)
+        conservative_close_size = min(self.config['close_kernel_size'], 3)
         
-        # Fill small gaps
-        cleaned = morphology.binary_closing(cleaned, morphology.disk(self.config['close_kernel_size']))
+        # Conservative opening to remove small noise without creating sharp edges
+        cleaned = morphology.binary_opening(mask, morphology.disk(conservative_open_size))
         
-        # Fill holes in tissue regions
-        cleaned = ndimage.binary_fill_holes(cleaned)
+        # Conservative closing to fill small gaps without over-connecting
+        cleaned = morphology.binary_closing(cleaned, morphology.disk(conservative_close_size))
+        
+        # Fill holes but only small ones to preserve tissue structure
+        # Large holes might be intentional (like glands or vessels)
+        # Ensure cleaned is boolean before invert operation to prevent type errors
+        cleaned_bool = cleaned.astype(bool)
+        labeled_holes = measure.label(~cleaned_bool)
+        for region in measure.regionprops(labeled_holes):
+            if region.area < 500:  # Only fill small holes
+                cleaned[labeled_holes == region.label] = True
         
         return cleaned
+    
+    def _final_large_bubble_removal(self, mask: np.ndarray, original_image: np.ndarray) -> np.ndarray:
+        """
+        Final pass to remove any remaining large circular artifacts that might have survived.
+        
+        This method specifically targets large, circular regions in the mask that don't
+        correspond to actual tissue in the original image.
+        """
+        gray = rgb2gray(original_image)
+        hsv_image = rgb2hsv(original_image)
+        
+        # Find connected components in the current mask
+        labeled_mask = measure.label(mask)
+        result = mask.copy()
+        
+        removed_bubbles = 0
+        
+        for region in measure.regionprops(labeled_mask):
+            if region.area > 800:  # Focus on larger regions
+                region_mask = labeled_mask == region.label
+                
+                # Extract properties of this region from the original image
+                region_gray = gray[region_mask]
+                region_saturation = hsv_image[:, :, 1][region_mask]
+                color_variation = np.std(original_image[region_mask], axis=1)
+                
+                # Calculate circularity
+                perimeter = region.perimeter
+                area = region.area
+                circularity = 4 * np.pi * area / (perimeter ** 2) if perimeter > 0 else 0
+                
+                # Calculate region properties
+                avg_brightness = np.mean(region_gray)
+                avg_saturation = np.mean(region_saturation)
+                avg_color_variation = np.mean(color_variation)
+                
+                # Criteria for identifying remaining air bubbles
+                is_large_circular = (area > 1000) and (circularity > 0.4)
+                is_bright_uniform = (avg_brightness > 0.8) and (avg_color_variation < 0.05)
+                is_low_saturation = avg_saturation < 0.2
+                
+                # AGGRESSIVE criteria: if it's large, circular, and lacks tissue characteristics
+                should_remove = is_large_circular and (is_bright_uniform or is_low_saturation)
+                
+                # Additional check: very large regions with low texture
+                is_very_large = area > 2000
+                has_low_texture = avg_color_variation < 0.03
+                
+                if is_very_large and has_low_texture and avg_saturation < 0.3:
+                    should_remove = True
+                
+                if should_remove:
+                    result[region_mask] = False
+                    removed_bubbles += 1
+                    self.logger.debug(f"Final removal: large bubble area={area}, circularity={circularity:.3f}, "
+                                    f"brightness={avg_brightness:.3f}, saturation={avg_saturation:.3f}")
+        
+        if removed_bubbles > 0:
+            self.logger.info(f"Final pass removed {removed_bubbles} large bubble artifacts")
+        
+        return result
     
     def _size_filtering(self, mask: np.ndarray) -> np.ndarray:
         """Remove objects that are too small to be meaningful tissue."""
@@ -458,6 +615,120 @@ class HESpecificImprover:
         metrics['staining_preservation'] = stained_in_improved / stained_in_original if stained_in_original > 0 else 0
         
         return metrics
+
+    def _smooth_artifact_removal(self, tissue_mask: np.ndarray, bubble_mask: np.ndarray, 
+                                bright_mask: np.ndarray, linear_mask: np.ndarray) -> np.ndarray:
+        """
+        Aggressively but smoothly remove ALL detected artifacts to ensure complete elimination.
+        
+        Uses multiple methods to ensure artifacts are fully removed while maintaining
+        smooth boundaries to prevent checkerboard patterns.
+        """
+        # Start with the tissue mask
+        result = tissue_mask.copy()
+        
+        # Create combined artifact mask
+        all_artifacts = bubble_mask | bright_mask | linear_mask
+        
+        if not np.any(all_artifacts):
+            return result
+        
+        all_artifacts_bool = all_artifacts.astype(bool)
+        
+        # Method 1: AGGRESSIVE dilation of artifact mask to catch halos and borders
+        # Use different dilation sizes based on artifact type and size
+        dilated_artifacts = np.zeros_like(all_artifacts_bool, dtype=bool)
+        
+        # Separate large and small artifacts for different treatment
+        labeled_artifacts = measure.label(all_artifacts_bool)
+        
+        for region in measure.regionprops(labeled_artifacts):
+            region_mask = labeled_artifacts == region.label
+            
+            if region.area > 1000:  # Large artifacts (like big air bubbles)
+                # VERY AGGRESSIVE dilation for large artifacts
+                large_dilated = morphology.binary_dilation(region_mask, morphology.disk(8))
+                dilated_artifacts |= large_dilated
+                self.logger.debug(f"Large artifact dilated with radius 8: area={region.area}")
+            elif region.area > 500:  # Medium artifacts
+                # Medium dilation
+                medium_dilated = morphology.binary_dilation(region_mask, morphology.disk(5))
+                dilated_artifacts |= medium_dilated
+            else:  # Small artifacts
+                # Standard dilation
+                small_dilated = morphology.binary_dilation(region_mask, morphology.disk(3))
+                dilated_artifacts |= small_dilated
+        
+        # Method 2: Apply morphological reconstruction with larger safety margin
+        # Erode less aggressively to preserve more of the artifact detection
+        artifact_markers = morphology.binary_erosion(all_artifacts_bool, morphology.disk(1))  
+        if np.any(artifact_markers):
+            reconstructed_artifacts = morphology.reconstruction(artifact_markers, dilated_artifacts)
+            reconstructed_artifacts_bool = reconstructed_artifacts.astype(bool)
+        else:
+            reconstructed_artifacts_bool = dilated_artifacts
+        
+        # Method 3: Distance-based removal with LARGER safety zone
+        from scipy.ndimage import distance_transform_edt
+        
+        # Create larger safety zones around ALL artifacts (not just remaining ones)
+        artifact_distance = distance_transform_edt(~all_artifacts_bool)
+        
+        # ADAPTIVE removal threshold based on artifact size
+        # Larger artifacts get larger removal zones
+        aggressive_removal_zone = np.zeros_like(all_artifacts_bool, dtype=bool)
+        
+        labeled_artifacts = measure.label(all_artifacts_bool)
+        
+        for region in measure.regionprops(labeled_artifacts):
+            region_mask = labeled_artifacts == region.label
+            
+            if region.area > 1000:  # Large artifacts
+                # VERY LARGE removal zone for big bubbles
+                removal_threshold = 10.0  # pixels
+                self.logger.debug(f"Large artifact removal zone: {removal_threshold} pixels for area={region.area}")
+            elif region.area > 500:  # Medium artifacts
+                removal_threshold = 7.0  # pixels
+            else:  # Small artifacts
+                removal_threshold = 5.0  # pixels
+            
+            # Calculate distance from this specific artifact
+            artifact_distance_local = distance_transform_edt(~region_mask)
+            removal_zone_local = artifact_distance_local < removal_threshold
+            aggressive_removal_zone |= removal_zone_local
+        
+        # Combine all removal methods
+        complete_removal_mask = reconstructed_artifacts_bool | aggressive_removal_zone.astype(bool)
+        
+        # Apply complete removal
+        result = result & ~complete_removal_mask
+        
+        # Method 4: Final cleanup with conservative morphological operations
+        # Only light cleanup to preserve the aggressive removal
+        result = morphology.binary_opening(result, morphology.disk(1))
+        
+        # Log removal statistics
+        artifacts_removed = np.sum(complete_removal_mask & tissue_mask)
+        total_artifacts = np.sum(all_artifacts_bool)
+        
+        # Calculate removal efficiency
+        removal_efficiency = (artifacts_removed / total_artifacts * 100) if total_artifacts > 0 else 0
+        
+        self.logger.info(f"Aggressively removed {artifacts_removed} artifact pixels (original: {total_artifacts}, efficiency: {removal_efficiency:.1f}%)")
+        
+        # Additional check for large artifacts that might need extra attention
+        remaining_artifacts = all_artifacts_bool & result
+        if np.any(remaining_artifacts):
+            large_remaining = measure.label(remaining_artifacts)
+            large_count = 0
+            for region in measure.regionprops(large_remaining):
+                if region.area > 500:
+                    large_count += 1
+            
+            if large_count > 0:
+                self.logger.warning(f"Warning: {large_count} large artifacts may still remain - will be caught in final pass")
+        
+        return result
 
 
 # Integration function to use this with the main system

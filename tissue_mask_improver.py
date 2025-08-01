@@ -159,8 +159,9 @@ class TissueMaskImprover:
         
         # Background estimation
         background_mask = (gray > 0.95) | (gray < 0.05)
-        if np.any(~background_mask):
-            props['background_color'] = np.median(image[~background_mask], axis=0)
+        background_mask_bool = background_mask.astype(bool)
+        if np.any(~background_mask_bool):
+            props['background_color'] = np.median(image[~background_mask_bool], axis=0)
         else:
             props['background_color'] = np.array([1.0, 1.0, 1.0])
         
@@ -364,29 +365,39 @@ class TissueMaskImprover:
         combined = enhanced_mask.copy()
         
         # Add regions from current mask that aren't artifacts
-        valid_current = current_mask & ~artifact_mask
+        # Ensure masks are boolean before invert operation
+        artifact_mask_bool = artifact_mask.astype(bool)
+        valid_current = current_mask & ~artifact_mask_bool
         combined |= valid_current
         
-        # Remove detected artifacts
-        combined &= ~artifact_mask
+        # Aggressively remove ALL detected artifacts to ensure complete elimination
+        combined = self._smooth_artifact_removal_generic(combined, artifact_mask)
         
         return combined
     
     def _morphological_refinement(self, mask: np.ndarray, image: np.ndarray) -> np.ndarray:
-        """Apply morphological operations to refine the mask."""
-        # Opening to remove small noise
-        refined = morphology.binary_opening(mask, morphology.disk(self.config['open_kernel_size']))
+        """Apply conservative morphological operations to refine the mask without creating patterns."""
+        # Use conservative kernel sizes to prevent checkerboard patterns
+        conservative_open_size = min(self.config['open_kernel_size'], 2)
+        conservative_close_size = min(self.config['close_kernel_size'], 3)
         
-        # Closing to fill small gaps
-        refined = morphology.binary_closing(refined, morphology.disk(self.config['close_kernel_size']))
+        # Conservative opening to remove small noise without creating sharp edges
+        refined = morphology.binary_opening(mask, morphology.disk(conservative_open_size))
         
-        # Remove small objects
-        refined = morphology.remove_small_objects(refined, min_size=self.config['min_object_area'])
+        # Conservative closing to fill small gaps without over-connecting
+        refined = morphology.binary_closing(refined, morphology.disk(conservative_close_size))
         
-        # Fill holes that are not too large
-        labeled_holes = measure.label(~refined)
+        # Remove small objects (but not too aggressively)
+        min_area = min(self.config['min_object_area'], 2000)  # Cap at reasonable size
+        refined = morphology.remove_small_objects(refined, min_size=min_area)
+        
+        # Fill holes conservatively - only small holes to preserve tissue structure
+        # Ensure refined is boolean before invert operation to prevent type errors
+        refined_bool = refined.astype(bool)
+        labeled_holes = measure.label(~refined_bool)
+        max_hole_size = min(self.config['max_hole_area'], 1000)  # Conservative hole filling
         for region in measure.regionprops(labeled_holes):
-            if region.area < self.config['max_hole_area']:
+            if region.area < max_hole_size:
                 refined[labeled_holes == region.label] = True
         
         return refined
@@ -478,4 +489,76 @@ class TissueMaskImprover:
         bright_in_improved = np.sum((gray > 0.9) & improved_mask)
         metrics['bright_artifact_reduction'] = (bright_in_original - bright_in_improved) / bright_in_original if bright_in_original > 0 else 0
         
-        return metrics 
+        return metrics
+    
+    def _smooth_artifact_removal_generic(self, tissue_mask: np.ndarray, artifact_mask: np.ndarray) -> np.ndarray:
+        """
+        Aggressively but smoothly remove ALL detected artifacts to ensure complete elimination.
+        
+        This method ensures artifacts are fully removed while maintaining smooth boundaries 
+        to prevent checkerboard patterns.
+        """
+        if not np.any(artifact_mask):
+            return tissue_mask
+        
+        result = tissue_mask.copy()
+        artifact_mask_bool = artifact_mask.astype(bool)
+        
+        # Method 1: AGGRESSIVE dilation of artifact mask to catch halos and borders
+        # This ensures we remove artifact boundaries and surrounding areas
+        dilated_artifacts = morphology.binary_dilation(artifact_mask_bool, morphology.disk(4))
+        
+        # Method 2: Apply morphological reconstruction with larger safety margin
+        # Erode less aggressively to preserve more of the artifact detection
+        artifact_markers = morphology.binary_erosion(artifact_mask_bool, morphology.disk(1))
+        if np.any(artifact_markers):
+            reconstructed_artifacts = morphology.reconstruction(artifact_markers, dilated_artifacts)
+            reconstructed_artifacts_bool = reconstructed_artifacts.astype(bool)
+        else:
+            reconstructed_artifacts_bool = dilated_artifacts
+        
+        # Method 3: Distance-based removal with AGGRESSIVE safety zone
+        from scipy.ndimage import distance_transform_edt
+        
+        # Create larger safety zones around ALL artifacts
+        artifact_distance = distance_transform_edt(~artifact_mask_bool)
+        
+        # AGGRESSIVE removal threshold - remove everything within 6 pixels of any artifact
+        aggressive_removal_threshold = 6.0  # pixels
+        aggressive_removal_zone = artifact_distance < aggressive_removal_threshold
+        
+        # Method 4: Add color-based removal for potential air bubbles in generic case
+        if hasattr(self, '_detect_color_based_artifacts'):
+            color_artifacts = self._detect_color_based_artifacts(result, tissue_mask)
+            aggressive_removal_zone = aggressive_removal_zone | color_artifacts
+        
+        # Combine all removal methods for complete elimination
+        complete_removal_mask = reconstructed_artifacts_bool | aggressive_removal_zone.astype(bool)
+        
+        # Apply complete removal
+        result = result & ~complete_removal_mask
+        
+        # Method 5: Final cleanup with minimal morphological operations
+        # Only light cleanup to preserve the aggressive removal
+        result = morphology.binary_opening(result, morphology.disk(1))
+        
+        # Log removal statistics
+        artifacts_removed = np.sum(complete_removal_mask & tissue_mask)
+        total_artifacts = np.sum(artifact_mask_bool)
+        self.logger.info(f"Aggressively removed {artifacts_removed} artifact pixels (original: {total_artifacts})")
+        
+        return result
+        
+    def _detect_color_based_artifacts(self, current_mask: np.ndarray, tissue_mask: np.ndarray) -> np.ndarray:
+        """
+        Additional color-based artifact detection for the generic improver.
+        
+        Detects very bright, low-saturation regions that might be air bubbles
+        missed by the main detection.
+        """
+        # This is a simplified version for the generic case
+        # In practice, this would use the original image, but we work with what we have
+        
+        # For now, return empty mask - this method is mainly a placeholder
+        # for future enhancement
+        return np.zeros_like(current_mask, dtype=bool) 
